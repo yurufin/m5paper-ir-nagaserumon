@@ -1,4 +1,4 @@
-# m5paper-ir
+# m5paper-ir-nagaserumon
 
 M5Paper(初代, ESP32)と M5Stack IR Unit (U002) で、赤外線リモコンの信号を **覚えて、決まった時刻に送る**。
 
@@ -51,3 +51,10 @@ IRremoteESP8266 は Arduino コア 3.x でビルドできないため使わず�
 cd ir-register   # または ir-timer
 pio run -t upload --upload-port COMx
 ```
+
+## ライセンス
+
+[MIT](LICENSE)。
+
+ただし `ir-timer/src/ui_fonts.h` は [Noto Sans JP](https://fonts.google.com/noto/specimen/Noto+Sans+JP)(SIL Open Font License 1.1)から生成した文字のビットマップ。
+「LIXIL」「流せるもん」は LIXIL の商標・製品名で、このリポジトリは LIXIL とは関係ない個人の作例。
