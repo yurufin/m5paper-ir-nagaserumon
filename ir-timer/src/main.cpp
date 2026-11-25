@@ -5,6 +5,7 @@
 //   予定: /ir/schedule.txt に HH:MM を 1 行ずつ(無ければ SCHEDULE_DEFAULT)
 //   手動: 画面の「今すぐ流す」ボタン、または押込ボタン(G38)。手動は 15 分ガードの対象外
 //   記録: 累計回数・最後の実行は NVS(Preferences)、履歴は SD の /ir/log.txt
+//   画面: 文字は tools/gen_fonts.ps1 で作る 1 ビットのフォント(src/ui_fonts.h)。シリアルで 'S' を送ると画面を PBM で出す
 //
 //   常時起動(USB 給電前提)。タッチでいつでも流せるようにするため電源は落とさない。
 #include <M5Unified.h>
@@ -15,6 +16,9 @@
 #include <time.h>
 #include <vector>
 #include <algorithm>
+#include <climits>
+
+#include "ui_fonts.h"  // tools/gen_fonts.ps1 が作る
 
 // ---- 設定 ----
 static const char* SCHEDULE_DEFAULT[] = {"00:00", "06:00", "12:00", "18:00"};
@@ -40,8 +44,11 @@ static const char* LOG_PATH = "/ir/log.txt";
 
 // 画面: 縦 540x960、天地逆(USB 端子が上)。向きが逆なら DISPLAY_ROTATION を 0 にする
 static constexpr int DISPLAY_ROTATION = 2;
-static constexpr int BTN_X = 30, BTN_Y = 430, BTN_W = 480, BTN_H = 220;
-static constexpr int MSG_Y = BTN_Y + BTN_H + 70;
+static constexpr int W = 540, H = 960;
+static constexpr int BAR_H = 44;                                    // 上の黒帯(電池・Wi-Fi)
+static constexpr int DATE_TOP = 180, TIME_BOTTOM = 376;             // 毎分書き換える範囲
+static constexpr int BTN_X = 26, BTN_Y = 388, BTN_W = 488, BTN_H = 112;
+static constexpr int BOX_Y = 548, BOX_BOTTOM = 948;                 // 自動洗浄時刻・最終洗浄時刻の枠
 
 // ---- 状態 ----
 static int rxPin = PORTB_PIN_33, txPin = PORTB_PIN_26;
@@ -52,12 +59,13 @@ static String signalNote;
 static std::vector<int> scheduleMin;  // 0:00 からの分。昇順
 static String scheduleNote;
 static Preferences prefs;
-static String message;     // ボタンの下に大きく(MANUAL TEST OK など)
-static String messageSub;  // その下に時刻
-static String ntpNote = "NTP: 未実行";
+static String message;     // 枠の下の黒帯(MANUAL FLUSH OK など)
+static String ntpNote = "NTP: 未実行";  // シリアルにだけ出す
+static bool ntpOk = false;              // 最後の時刻合わせが成功したか(Wi-Fi アイコン)
 static uint32_t lastNtpMs = 0;
 static uint32_t lastManualMs = 0;
-static int lastDrawnMinute = -1;
+static int drawnMinute = -1, drawnHour = -1;
+static uint32_t drawnNext = 0;
 
 enum Kind : uint8_t { KIND_NONE = 0, KIND_AUTO = 1, KIND_MANUAL = 2 };
 
@@ -207,9 +215,10 @@ static void appendLog(const String& line) {
   f.close();
 }
 
-// ---- NTP(SD の /ssid.txt: 1 行 "SSID,PASSWORD"。Clock225 と同じ形式) ----
+// ---- NTP(SD の /ssid.txt: 1 行 "SSID,PASSWORD"。複数行なら上から順に試す) ----
 static void syncNtp() {
   lastNtpMs = millis();
+  ntpOk = false;
   if (!sdOk) { ntpNote = "NTP: SD なし"; return; }
   File f = SD.open("/ssid.txt");
   if (!f) { ntpNote = "NTP: /ssid.txt なし"; return; }
@@ -244,7 +253,8 @@ static void syncNtp() {
     if (getLocalTime(&tmv, 10000)) {
       M5.Rtc.setDateTime(&tmv);  // RTC には日本時間をそのまま入れる
       uint32_t now; m5::rtc_datetime_t dt;
-      ntpNote = readNow(now, dt) ? "NTP: " + fmtTime(now) + " に合わせました" : String("NTP: RTC 書き込み失敗");
+      ntpOk = readNow(now, dt);
+      ntpNote = ntpOk ? "NTP: " + fmtTime(now) + " に合わせました" : String("NTP: RTC 書き込み失敗");
     } else {
       ntpNote = "NTP: 時刻を取れませんでした";
     }
@@ -296,102 +306,255 @@ static bool sendFlush() {
 }
 
 // ---- 画面 ----
-static void drawClockLine() {
-  uint32_t now; m5::rtc_datetime_t dt;
-  auto& d = M5.Display;
-  d.startWrite();
-  d.fillRect(30, 80, 480, 40, TFT_WHITE);
-  d.setFont(&fonts::lgfxJapanGothic_36);
-  d.drawString(readNow(now, dt) ? fmtTime(now) : String("時刻未設定"), 30, 80);
-  d.endWrite();
-  d.display();
+//   1 ビットのキャンバスに全部描き、変わった範囲だけ電子ペーパーへ送る
+static M5Canvas canvas(&M5.Display);
+
+static const UiGlyph* findGlyph(const UiFont& f, uint32_t code) {
+  int lo = 0, hi = f.count - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) / 2;
+    if (f.glyphs[mid].code == code) return &f.glyphs[mid];
+    if (f.glyphs[mid].code < code) lo = mid + 1; else hi = mid - 1;
+  }
+  return nullptr;  // フォントに無い文字は描かない(gen_fonts.cs に足す)
+}
+
+static std::vector<uint32_t> decodeUtf8(const String& s) {
+  std::vector<uint32_t> out;
+  const uint8_t* p = (const uint8_t*)s.c_str();
+  while (*p) {
+    uint32_t c = *p;
+    int n = c < 0x80 ? 0 : c < 0xE0 ? 1 : c < 0xF0 ? 2 : 3;
+    if (n) c &= (0x3F >> n);
+    p++;
+    for (int i = 0; i < n && (*p & 0xC0) == 0x80; i++, p++) c = (c << 6) | (*p & 0x3F);
+    out.push_back(c);
+  }
+  return out;
+}
+
+struct Ink { int left = INT_MAX, right = INT_MIN, top = INT_MAX, bottom = INT_MIN; };
+
+// 描画原点(行の左上)を 0,0 としたときのインクの範囲
+static Ink measure(const UiFont& f, const String& s, int spacing) {
+  Ink k;
+  int pen = 0;
+  for (uint32_t c : decodeUtf8(s)) {
+    const UiGlyph* g = findGlyph(f, c);
+    if (!g) continue;
+    if (g->w) {
+      k.left = std::min(k.left, pen + g->x);
+      k.right = std::max(k.right, pen + g->x + g->w);
+      k.top = std::min(k.top, (int)g->y);
+      k.bottom = std::max(k.bottom, g->y + g->h);
+    }
+    pen += g->adv + spacing;
+  }
+  if (k.left == INT_MAX) k = Ink{0, 0, 0, 0};
+  return k;
+}
+
+static void drawAt(const UiFont& f, const String& s, int ox, int oy, uint16_t color, int spacing) {
+  int pen = ox;
+  for (uint32_t c : decodeUtf8(s)) {
+    const UiGlyph* g = findGlyph(f, c);
+    if (!g) continue;
+    if (g->w) canvas.drawBitmap(pen + g->x, oy + g->y, f.bits + g->off, g->w, g->h, color);
+    pen += g->adv + spacing;
+  }
+}
+
+// インクの中心を (cx, top〜bottom の中央) に合わせる
+static void drawCentered(const UiFont& f, const String& s, int cx, int top, int bottom, uint16_t color = TFT_BLACK,
+                         int spacing = 0) {
+  Ink k = measure(f, s, spacing);
+  drawAt(f, s, cx - (k.left + k.right) / 2, (top + bottom) / 2 - (k.top + k.bottom) / 2, color, spacing);
+}
+
+// インクの左端を x に、上下は top〜bottom の中央に
+static void drawLeft(const UiFont& f, const String& s, int x, int top, int bottom, uint16_t color = TFT_BLACK) {
+  Ink k = measure(f, s, 0);
+  drawAt(f, s, x - k.left, (top + bottom) / 2 - (k.top + k.bottom) / 2, color, 0);
+}
+
+// 太さ t の角丸の枠
+static void frameRound(int x, int y, int w, int h, int r, int t, uint16_t inner = TFT_WHITE) {
+  canvas.fillRoundRect(x, y, w, h, r, TFT_BLACK);
+  canvas.fillRoundRect(x + t, y + t, w - 2 * t, h - 2 * t, std::max(r - t, 0), inner);
+}
+
+static void drawStatusBar() {
+  canvas.fillRect(0, 0, W, BAR_H, TFT_BLACK);
+  // 電池
+  int level = M5.Power.getBatteryLevel();
+  const int bx = 14, by = 11, bw = 40, bh = 22;
+  canvas.fillRect(bx, by, bw, bh, TFT_WHITE);
+  canvas.fillRect(bx + 2, by + 2, bw - 4, bh - 4, TFT_BLACK);
+  canvas.fillRect(bx + bw, by + 6, 4, bh - 12, TFT_WHITE);
+  if (level > 0) canvas.fillRect(bx + 4, by + 4, (bw - 8) * std::min(level, 100) / 100, bh - 8, TFT_WHITE);
+  drawLeft(FONT_STATUS, level >= 0 ? String(level) + "%" : String("--%"), bx + bw + 14, 0, BAR_H, TFT_WHITE);
+  // Wi-Fi(最後の時刻合わせが成功していれば)
+  if (ntpOk) {
+    const int cx = W - 34, cy = 36;
+    canvas.fillArc(cx, cy, 23, 27, 225, 315, TFT_WHITE);
+    canvas.fillArc(cx, cy, 14, 18, 225, 315, TFT_WHITE);
+    canvas.fillCircle(cx, cy - 3, 4, TFT_WHITE);
+  }
+}
+
+static void drawDateTime(bool valid, uint32_t now) {
+  canvas.fillRect(0, DATE_TOP, W, TIME_BOTTOM - DATE_TOP, TFT_WHITE);
+  if (!valid) {
+    drawCentered(FONT_DATE, "時刻未設定", W / 2, DATE_TOP, DATE_TOP + 46);
+    drawCentered(FONT_TIME, "--:--", W / 2, DATE_TOP + 56, TIME_BOTTOM);
+    return;
+  }
+  static const char* WDAY[] = {"日", "月", "火", "水", "木", "金", "土"};
+  time_t tt = (time_t)now;
+  struct tm tmv;
+  gmtime_r(&tt, &tmv);
+  char buf[40];
+  snprintf(buf, sizeof(buf), "%d/%02d/%02d (%s)", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, WDAY[tmv.tm_wday]);
+  drawCentered(FONT_DATE, buf, W / 2, DATE_TOP, DATE_TOP + 46);
+  snprintf(buf, sizeof(buf), "%d:%02d", tmv.tm_hour, tmv.tm_min);
+  drawCentered(FONT_TIME, buf, W / 2, DATE_TOP + 56, TIME_BOTTOM);
 }
 
 static void drawButton(bool pressed) {
-  auto& d = M5.Display;
-  d.startWrite();
-  d.fillRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, 24, pressed ? TFT_BLACK : TFT_WHITE);
-  d.drawRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, 24, TFT_BLACK);
-  d.drawRoundRect(BTN_X + 1, BTN_Y + 1, BTN_W - 2, BTN_H - 2, 23, TFT_BLACK);
-  d.drawRoundRect(BTN_X + 2, BTN_Y + 2, BTN_W - 4, BTN_H - 4, 22, TFT_BLACK);
-  d.setFont(&fonts::lgfxJapanGothic_40);
-  d.setTextColor(pressed ? TFT_WHITE : TFT_BLACK);
-  d.setTextDatum(middle_center);
-  d.drawString(pressed ? "送信中…" : "今すぐ流す", BTN_X + BTN_W / 2, BTN_Y + BTN_H / 2);
-  d.setTextDatum(top_left);
-  d.setTextColor(TFT_BLACK, TFT_WHITE);
-  d.endWrite();
-  d.display();
+  canvas.fillRect(BTN_X, BTN_Y, BTN_W, BTN_H, TFT_WHITE);
+  frameRound(BTN_X, BTN_Y, BTN_W, BTN_H, 22, 6, pressed ? TFT_BLACK : TFT_WHITE);
+  drawCentered(FONT_BUTTON, pressed ? "送信中…" : "今すぐ流す", W / 2, BTN_Y, BTN_Y + BTN_H,
+               pressed ? TFT_WHITE : TFT_BLACK);
 }
 
-static void drawScreen() {
-  auto& d = M5.Display;
-  uint32_t now; m5::rtc_datetime_t dt;
-  bool valid = readNow(now, dt);
+static String barText(bool timeValid) {
+  if (signalRaw.empty()) return sdOk ? "信号ファイルがありません" : "SD が読めません";
+  if (!timeValid) return "時刻未設定のため自動洗浄停止中";
+  return message;
+}
 
-  d.startWrite();
-  d.fillScreen(TFT_WHITE);
-  d.setTextColor(TFT_BLACK, TFT_WHITE);
-  d.setFont(&fonts::lgfxJapanGothic_40);
-  d.drawString("AUTO TOILET FLUSHER", 30, 20);
+static void drawBox(bool valid, uint32_t now) {
+  const int L = 14, R = W - 14;
+  frameRound(L, BOX_Y, R - L, BOX_BOTTOM - BOX_Y, 20, 3);
+  frameRound(L + 7, BOX_Y + 7, R - L - 14, BOX_BOTTOM - BOX_Y - 14, 14, 2);
 
-  d.setFont(&fonts::lgfxJapanGothic_24);
-  int y = 140;
-  String sched = "予定:";
-  for (int m : scheduleMin) {
-    char b[8];
-    snprintf(b, sizeof(b), " %02d:%02d", m / 60, m % 60);
-    sched += b;
+  int y = BOX_Y + 18;
+  drawLeft(FONT_LABEL, "◆自動洗浄時刻", 40, y, y + 36);
+  y += 46;
+
+  // 2 列。次の予定を角丸で囲む
+  size_t n = std::min<size_t>(scheduleMin.size(), 8);
+  int rowH = n <= 4 ? 62 : n <= 6 ? 48 : 40;
+  int next = valid ? (int)((nextSlot(now) % 86400) / 60) : -1;
+  const int colX[2] = {150, 390};
+  for (size_t i = 0; i < n; i++) {
+    int cx = colX[i % 2], top = y + (int)(i / 2) * rowH;
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d:%02d", scheduleMin[i] / 60, scheduleMin[i] % 60);
+    if (scheduleMin[i] == next) frameRound(cx - 100, top + 3, 200, rowH - 6, 12, 3);
+    drawCentered(FONT_SLOT, buf, cx, top, top + rowH);
   }
-  d.drawString(sched, 30, y); y += 34;
-  d.drawString(valid ? "次回: " + fmtTime(nextSlot(now)) : String("次回: 時刻未設定のため自動送信しません"), 30, y); y += 46;
+  y += (int)((n + 1) / 2) * rowH + 8;
+
+  canvas.fillRect(40, y, W - 80, 2, TFT_BLACK);
+  y += 12;
+  drawLeft(FONT_LABEL, "◆最終洗浄時刻", 40, y, y + 36);
+  y += 42;
 
   uint32_t lastT = prefs.getUInt("lastTime", 0);
   uint8_t lastK = prefs.getUChar("lastKind", KIND_NONE);
-  String lastS = "最終: ";
-  if (lastK == KIND_NONE) lastS += "なし";
-  else lastS += (lastT ? fmtTime(lastT) : String("時刻不明")) + (lastK == KIND_AUTO ? "(自動)" : "(手動)");
-  d.drawString(lastS, 30, y); y += 34;
-  d.drawString(String("累計: ") + prefs.getUInt("total", 0) + " 回", 30, y); y += 46;
+  String lastS;
+  if (lastK == KIND_NONE) lastS = "なし";
+  else lastS = (lastT ? fmtTime(lastT) : String("時刻不明")) + (lastK == KIND_AUTO ? " (自動)" : " (手動)");
+  drawCentered(FONT_LAST, lastS, W / 2, y, y + 42);
+  y += 52;
 
-  d.drawString("信号: " + signalNote, 30, y); y += 34;
-  int mv = M5.Power.getBatteryVoltage();
-  d.drawString(String("電池: ") + (mv > 0 ? String(mv / 1000.0, 2) + " V" : String("-")) + "   送信 G" + txPin +
-                   "(" + pinNote + ")",
-               30, y); y += 34;
-  d.drawString(ntpNote, 30, y); y += 34;
-
-  d.setFont(&fonts::lgfxJapanGothic_20);
-  d.drawString("押込ボタン(G38)でも流せます", BTN_X + 10, BTN_Y + BTN_H + 14);
-
-  if (message.length()) {
-    d.setFont(&fonts::lgfxJapanGothic_40);
-    d.drawString(message, 30, MSG_Y);
-    d.setFont(&fonts::lgfxJapanGothic_24);
-    d.drawString(messageSub, 30, MSG_Y + 56);
+  String bar = barText(valid);
+  if (bar.length()) {
+    canvas.fillRoundRect(40, y, W - 80, 50, 8, TFT_BLACK);
+    drawCentered(FONT_BAR, bar, W / 2, y, y + 50, TFT_WHITE);
   }
-  d.endWrite();
+}
 
-  drawButton(false);
-  drawClockLine();
-  lastDrawnMinute = valid ? (int)(now / 60) : -1;
+static void render(bool pressed = false) {
+  uint32_t now; m5::rtc_datetime_t dt;
+  bool valid = readNow(now, dt);
+  canvas.fillScreen(TFT_WHITE);
+  drawStatusBar();
+  drawCentered(FONT_LOGO, "LIXIL", W / 2, 52, 84, TFT_BLACK, 8);
+  drawCentered(FONT_TITLE, "流せるもん!", W / 2, 88, 176);
+  drawDateTime(valid, now);
+  drawButton(pressed);
+  drawCentered(FONT_HINT, "★サイドの押込ボタン(G38)でも流せます", W / 2, BTN_Y + BTN_H + 6, BTN_Y + BTN_H + 40);
+  drawBox(valid, now);
+}
+
+static void pushRegion(int y0, int y1, epd_mode_t mode) {
+  auto& d = M5.Display;
+  d.setEpdMode(mode);
+  d.setClipRect(0, y0, W, y1 - y0);
+  canvas.pushSprite(0, 0);
+  d.clearClipRect();
+  d.display();
+}
+
+// 全面をきれいに書き直す(残像も消える)
+static void drawScreen() {
+  render();
+  pushRegion(0, H, epd_mode_t::epd_quality);
+  uint32_t now; m5::rtc_datetime_t dt;
+  bool valid = readNow(now, dt);
+  drawnMinute = valid ? (int)(now / 60) : -1;
+  drawnHour = valid ? (int)(now / 3600) : -1;
+  drawnNext = valid ? nextSlot(now) : 0;
+}
+
+// 毎分: 時計と上の帯だけ。1 時間ごと・次の予定が変わったときは全面
+static void updateMinute() {
+  uint32_t now; m5::rtc_datetime_t dt;
+  if (!readNow(now, dt)) return;
+  if ((int)(now / 60) == drawnMinute) return;
+  if ((int)(now / 3600) != drawnHour || nextSlot(now) != drawnNext) { drawScreen(); return; }
+  render();
+  pushRegion(0, BAR_H, epd_mode_t::epd_fast);
+  pushRegion(DATE_TOP, TIME_BOTTOM, epd_mode_t::epd_fast);
+  drawnMinute = now / 60;
+}
+
+static void showPressed() {
+  render(true);
+  pushRegion(BTN_Y, BTN_Y + BTN_H, epd_mode_t::epd_fast);
+}
+
+// シリアルで 'S' を受けたら画面(キャンバス)を PBM(P4)で出す。見た目の確認用
+static void dumpScreen() {
+  Serial.printf("P4\n%d %d\n", W, H);
+  uint8_t row[(W + 7) / 8];
+  for (int y = 0; y < H; y++) {
+    for (int bx = 0; bx < (W + 7) / 8; bx++) {
+      uint8_t b = 0;
+      for (int i = 0; i < 8; i++)
+        if (bx * 8 + i < W && canvas.readPixel(bx * 8 + i, y) != TFT_WHITE) b |= 0x80 >> i;
+      row[bx] = b;
+    }
+    Serial.write(row, sizeof(row));
+  }
+  Serial.flush();
 }
 
 // ---- 実行 ----
 static void doFlush(Kind kind, uint32_t now, bool timeValid) {
-  if (kind == KIND_MANUAL) drawButton(true);
+  if (kind == KIND_MANUAL) showPressed();
   bool ok = sendFlush();
   String when = timeValid ? fmtTime(now) : String("時刻不明");
   if (ok) {
-    prefs.putUInt("total", prefs.getUInt("total", 0) + 1);
+    prefs.putUInt("total", prefs.getUInt("total", 0) + 1);  // 画面には出さないが記録は続ける
     prefs.putUInt("lastTime", timeValid ? now : 0);
     prefs.putUChar("lastKind", kind);
     if (kind == KIND_AUTO) prefs.putUInt("lastAuto", now);
-    message = kind == KIND_AUTO ? "AUTO FLUSH OK" : "MANUAL TEST OK";
-    messageSub = when;
+    message = kind == KIND_AUTO ? "AUTO FLUSH OK" : "MANUAL FLUSH OK";
   } else {
-    message = kind == KIND_AUTO ? "AUTO FLUSH 失敗" : "MANUAL TEST 失敗";
-    messageSub = when + (signalRaw.empty() ? " 信号なし" : "");
+    message = kind == KIND_AUTO ? "AUTO FLUSH 失敗" : "MANUAL FLUSH 失敗";
   }
   appendLog(when + "," + (kind == KIND_AUTO ? "auto" : "manual") + "," + (ok ? "ok" : "ng"));
   drawScreen();
@@ -441,6 +604,9 @@ void setup() {
   M5.Display.setRotation(DISPLAY_ROTATION);
   M5.Display.setEpdMode(epd_mode_t::epd_fast);
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  canvas.setColorDepth(1);
+  canvas.setPsram(true);
+  canvas.createSprite(W, H);
 
   detectPins();
   prefs.begin("flush", false);
@@ -468,15 +634,13 @@ void loop() {
   auto t = M5.Touch.getDetail();
   if (t.wasPressed() && t.x >= BTN_X && t.x < BTN_X + BTN_W && t.y >= BTN_Y && t.y < BTN_Y + BTN_H) manualFlush();
 
+  if (Serial.available() && Serial.read() == 'S') dumpScreen();
+
   static uint32_t lastTick = 0;
   if (millis() - lastTick >= 1000) {
     lastTick = millis();
     checkSchedule();
-    uint32_t now; m5::rtc_datetime_t dt;
-    if (readNow(now, dt) && (int)(now / 60) != lastDrawnMinute) {
-      lastDrawnMinute = now / 60;
-      drawClockLine();
-    }
+    updateMinute();
     if (millis() - lastNtpMs >= NTP_INTERVAL_MS) {
       syncNtp();
       drawScreen();
