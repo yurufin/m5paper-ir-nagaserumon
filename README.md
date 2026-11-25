@@ -36,6 +36,12 @@ M5Paper(初代, ESP32)と M5Stack IR Unit (U002) で、赤外線リモコンの�
 /ir/log.txt          ir-timer の実行履歴
 ```
 
+[sd/](sd/) に SD の見本がある。中身をそのまま SD のルートにコピーして使える。
+
+- `sd/ssid.txt`: 見本。`YOUR_SSID,YOUR_PASSWORD` を書き換える
+- `sd/ir/schedule.txt`: 既定と同じ 0/6/12/18 時
+- `sd/ir/flush.txt`: **流せるもん(CWA-67B)の洗浄ボタンの実物**(ir-register で記録したもの)。同じ機種なら ir-register を使わずにこれで流せるはず
+
 ## 開発環境
 
 PlatformIO(espressif32 / Arduino コア 3.x)、M5Unified + M5GFX。
